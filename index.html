@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>F&B Shop Manager - Offline</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="logo">
+                <h1>🍽️ F&B Manager</h1>
+            </div>
+            <nav class="menu">
+                <button class="menu-btn active" data-page="dashboard">
+                    📊 Dashboard
+                </button>
+                <button class="menu-btn" data-page="orders">
+                    🛒 Orders
+                </button>
+                <button class="menu-btn" data-page="menu">
+                    📋 Menu Items
+                </button>
+                <button class="menu-btn" data-page="inventory">
+                    📦 Inventory
+                </button>
+                <button class="menu-btn" data-page="reports">
+                    📈 Reports
+                </button>
+                <button class="menu-btn" data-page="settings">
+                    ⚙️ Settings
+                </button>
+            </nav>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Header -->
+            <header class="header">
+                <h2 id="page-title">Dashboard</h2>
+                <div class="header-right">
+                    <span id="current-date"></span>
+                </div>
+            </header>
+
+            <!-- Dashboard Page -->
+            <section id="dashboard" class="page active">
+                <div class="dashboard-grid">
+                    <div class="stat-card">
+                        <h3>Today's Sales</h3>
+                        <p class="stat-value" id="today-sales">₹0</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Total Orders</h3>
+                        <p class="stat-value" id="today-orders">0</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Menu Items</h3>
+                        <p class="stat-value" id="menu-count">0</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Low Stock Items</h3>
+                        <p class="stat-value warning" id="low-stock">0</p>
+                    </div>
+                </div>
+
+                <div class="dashboard-content">
+                    <div class="chart-container">
+                        <h3>Recent Orders</h3>
+                        <div id="recent-orders-list" class="orders-table">
+                            <p class="empty-state">No orders yet</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Orders Page -->
+            <section id="orders" class="page">
+                <div class="page-header">
+                    <h2>Manage Orders</h2>
+                    <button class="btn btn-primary" id="new-order-btn">+ New Order</button>
+                </div>
+
+                <!-- New Order Form -->
+                <div id="order-form" class="form-container" style="display: none;">
+                    <h3>Create New Order</h3>
+                    <form id="order-form-element">
+                        <div class="form-group">
+                            <label>Customer Name</label>
+                            <input type="text" id="customer-name" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Order Type</label>
+                            <select id="order-type" required>
+                                <option>Dine-in</option>
+                                <option>Takeaway</option>
+                                <option>Delivery</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Add Items</label>
+                            <div id="items-container" class="items-container"></div>
+                            <button type="button" class="btn btn-secondary" id="add-item-btn">+ Add Item</button>
+                        </div>
+                        <div class="form-group">
+                            <label>Total Amount</label>
+                            <p class="total-amount">₹<span id="order-total">0</span></p>
+                        </div>
+                        <div class="form-group">
+                            <label>Notes</label>
+                            <textarea id="order-notes" rows="3"></textarea>
+                        </div>
+                        <div class="form-actions">
+                            <button type="submit" class="btn btn-primary">Save Order</button>
+                            <button type="button" class="btn btn-secondary" id="cancel-order-btn">Cancel</button>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- Orders List -->
+                <div id="orders-list" class="orders-table">
+                    <p class="empty-state">No orders yet. Create a new order to get started.</p>
+                </div>
+            </section>
+
+            <!-- Menu Items Page -->
+            <section id="menu" class="page">
+                <div class="page-header">
+                    <h2>Menu Items</h2>
+                    <button class="btn btn-primary" id="new-item-btn">+ Add Item</button>
+                </div>
+
+                <!-- Menu Item Form -->
+                <div id="menu-form" class="form-container" style="display: none;">
+                    <h3>Add/Edit Menu Item</h3>
+                    <form id="menu-form-element">
+                        <input type="hidden" id="menu-item-id">
+                        <div class="form-group">
+                            <label>Item Name</label>
+                            <input type="text" id="item-name" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Category</label>
+                            <input type="text" id="item-category" placeholder="e.g., Appetizer, Main, Beverage" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Price (₹)</label>
+                            <input type="number" id="item-price" step="0.01" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Description</label>
+                            <textarea id="item-description" rows="3"></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" id="item-available">
+                                Available
+                            </label>
+                        </div>
+                        <div class="form-actions">
+                            <button type="submit" class="btn btn-primary">Save Item</button>
+                            <button type="button" class="btn btn-secondary" id="cancel-menu-btn">Cancel</button>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- Menu Items Display -->
+                <div id="menu-list" class="menu-grid">
+                    <p class="empty-state">No menu items yet. Add your first item!</p>
+                </div>
+            </section>
+
+            <!-- Inventory Page -->
+            <section id="inventory" class="page">
+                <div class="page-header">
+                    <h2>Inventory Management</h2>
+                    <button class="btn btn-primary" id="new-inventory-btn">+ Add Stock</button>
+                </div>
+
+                <!-- Inventory Form -->
+                <div id="inventory-form" class="form-container" style="display: none;">
+                    <h3>Add/Update Inventory</h3>
+                    <form id="inventory-form-element">
+                        <input type="hidden" id="inventory-id">
+                        <div class="form-group">
+                            <label>Item Name</label>
+                            <input type="text" id="inv-item-name" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Quantity</label>
+                            <input type="number" id="inv-quantity" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Unit</label>
+                            <input type="text" id="inv-unit" placeholder="e.g., kg, litre, pieces" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Cost Price (₹)</label>
+                            <input type="number" id="inv-cost-price" step="0.01" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Minimum Stock Level</label>
+                            <input type="number" id="inv-min-level" required>
+                        </div>
+                        <div class="form-actions">
+                            <button type="submit" class="btn btn-primary">Save Stock</button>
+                            <button type="button" class="btn btn-secondary" id="cancel-inventory-btn">Cancel</button>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- Inventory List -->
+                <div id="inventory-list" class="inventory-table">
+                    <p class="empty-state">No inventory items yet. Add your first item!</p>
+                </div>
+            </section>
+
+            <!-- Reports Page -->
+            <section id="reports" class="page">
+                <div class="page-header">
+                    <h2>Sales Reports</h2>
+                </div>
+
+                <div class="report-filters">
+                    <div class="filter-group">
+                        <label>Date Range</label>
+                        <input type="date" id="report-start-date">
+                        <input type="date" id="report-end-date">
+                        <button class="btn btn-primary" id="filter-report-btn">Filter</button>
+                    </div>
+                </div>
+
+                <div class="report-cards">
+                    <div class="stat-card">
+                        <h3>Total Sales</h3>
+                        <p class="stat-value" id="report-total-sales">₹0</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Total Orders</h3>
+                        <p class="stat-value" id="report-total-orders">0</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Average Order Value</h3>
+                        <p class="stat-value" id="report-avg-order">₹0</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Top Item</h3>
+                        <p class="stat-value" id="report-top-item">-</p>
+                    </div>
+                </div>
+
+                <div class="report-section">
+                    <h3>Sales by Category</h3>
+                    <div id="category-sales" class="table-container">
+                        <p class="empty-state">No data available</p>
+                    </div>
+                </div>
+
+                <div class="report-section">
+                    <h3>Daily Sales</h3>
+                    <div id="daily-sales" class="table-container">
+                        <p class="empty-state">No data available</p>
+                    </div>
+                </div>
+
+                <button class="btn btn-secondary" id="export-report-btn">📥 Export to CSV</button>
+            </section>
+
+            <!-- Settings Page -->
+            <section id="settings" class="page">
+                <div class="page-header">
+                    <h2>Settings</h2>
+                </div>
+
+                <div class="settings-section">
+                    <h3>Shop Information</h3>
+                    <form id="settings-form">
+                        <div class="form-group">
+                            <label>Shop Name</label>
+                            <input type="text" id="shop-name" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Owner Name</label>
+                            <input type="text" id="owner-name" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Phone</label>
+                            <input type="tel" id="shop-phone" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Currency Symbol</label>
+                            <input type="text" id="currency-symbol" value="₹" required>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Save Settings</button>
+                    </form>
+                </div>
+
+                <div class="settings-section danger">
+                    <h3>Data Management</h3>
+                    <button class="btn btn-warning" id="export-data-btn">📤 Export All Data (JSON)</button>
+                    <button class="btn btn-warning" id="import-data-btn">📥 Import Data (JSON)</button>
+                    <input type="file" id="import-file" accept=".json" style="display: none;">
+                    <button class="btn btn-danger" id="reset-data-btn">🗑️ Clear All Data</button>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="db.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
