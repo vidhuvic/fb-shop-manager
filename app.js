@@ -1,1158 +1,1365 @@
-// ============ APPLICATION STATE ============
-let currentUser = null;
-let cart = [];
-let selectedCategory = 'All';
+/* ============================================================
+   F&B Shop Manager — application logic
+   Rendering is escaped, events are delegated, and every id coming
+   back from the DOM is converted before it touches the database.
+   ============================================================ */
+'use strict';
 
-// ============ INITIALIZATION ============
-document.addEventListener('DOMContentLoaded', async () => {
+const SESSION_KEY = 'fbShopSession';
+
+/**
+ * Session storage throws outright in a few setups (Safari private mode,
+ * some file:// configurations). Falling back to memory keeps the till
+ * usable for the rest of the session instead of failing the sign-in.
+ */
+const session = {
+    fallback: null,
+    read() {
+        try {
+            return JSON.parse(sessionStorage.getItem(SESSION_KEY) || 'null');
+        } catch (_) {
+            return this.fallback;
+        }
+    },
+    write(value) {
+        this.fallback = value;
+        try {
+            sessionStorage.setItem(SESSION_KEY, JSON.stringify(value));
+        } catch (_) { /* memory only */ }
+    },
+    clear() {
+        this.fallback = null;
+        try {
+            sessionStorage.removeItem(SESSION_KEY);
+        } catch (_) { /* memory only */ }
+    }
+};
+
+const state = {
+    user: null,
+    settings: { ...DEFAULT_SETTINGS },
+    page: null,
+    cart: [],
+    menu: [],
+    posCategory: 'All',
+    posSearch: '',
+    editing: {},
+    submitting: false
+};
+
+const PAGES = {
+    dashboard: { label: 'Dashboard', icon: '📊', title: 'Dashboard', roles: ['owner'] },
+    pos: { label: 'New sale', icon: '🧾', title: 'New sale', roles: ['owner', 'staff'] },
+    orders: { label: 'Orders', icon: '📒', title: 'Orders', roles: ['owner', 'staff'] },
+    menu: { label: 'Menu', icon: '🍲', title: 'Menu', roles: ['owner'] },
+    inventory: { label: 'Stock', icon: '📦', title: 'Stock', roles: ['owner'] },
+    reports: { label: 'Reports', icon: '📈', title: 'Reports', roles: ['owner', 'staff'] },
+    users: { label: 'People', icon: '👥', title: 'People', roles: ['owner'] },
+    settings: { label: 'Settings', icon: '⚙️', title: 'Settings', roles: ['owner'] }
+};
+
+const ORDER_TYPES = ['Dine-in', 'Takeaway', 'Delivery'];
+const PAYMENT_METHODS = ['Cash', 'Card', 'UPI'];
+
+/* ------------------------------------------------------------
+   Boot
+   ------------------------------------------------------------ */
+let booted = false;
+
+async function boot() {
+    if (booted) return;
+    booted = true;
+    bindGlobalEvents();
     try {
         await initDB();
-        await initializeDefaultData();
-        checkLogin();
-        setupEventListeners();
+        await seedDefaults();
+        state.settings = await getSettings();
+        await restoreSession();
     } catch (error) {
-        console.error('Initialization error:', error);
-        showNotification('Failed to initialize app', 'error');
-    }
-});
-
-// ============ LOGIN MANAGEMENT ============
-function checkLogin() {
-    const storedUser = sessionStorage.getItem('currentUser');
-    if (storedUser) {
-        currentUser = JSON.parse(storedUser);
-        showApp();
-    } else {
-        showLoginPage();
+        console.error(error);
+        renderFatal(error);
     }
 }
 
-function showLoginPage() {
-    document.body.innerHTML = `
-        <div class="login-container">
-            <div class="login-card">
-                <h1>🍽️ F&B Shop Manager</h1>
-                <p class="subtitle">Offline & Local Management System</p>
-                <form id="login-form" class="login-form">
-                    <div class="form-group">
-                        <label>Username</label>
-                        <input type="text" id="username" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Password</label>
-                        <input type="password" id="password" required>
-                    </div>
-                    <button type="submit" class="btn">Login</button>
-                    <div id="login-error" class="error"></div>
-                </form>
-                <div class="demo-credentials">
-                    <strong>Demo Credentials:</strong>
-                    <p><strong>Owner:</strong> owner / owner123</p>
-                    <p><strong>Staff:</strong> staff / staff123</p>
-                </div>
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot, { once: true });
+} else {
+    boot();
+}
+
+function renderFatal(error) {
+    document.getElementById('app').innerHTML = `
+        <div class="screen">
+            <div class="card notice">
+                <h1>The app could not start</h1>
+                <p>${esc(error && error.message ? error.message : 'Unknown error.')}</p>
+                <p class="muted">Private or incognito windows block local storage in some browsers. Try a normal window, or a different browser.</p>
             </div>
-        </div>
-    `;
-
-    document.getElementById('login-form').addEventListener('submit', handleLogin);
+        </div>`;
 }
 
-async function handleLogin(e) {
-    e.preventDefault();
-    const username = document.getElementById('username').value;
-    const password = document.getElementById('password').value;
+/* ------------------------------------------------------------
+   Session
+   ------------------------------------------------------------ */
+async function restoreSession() {
+    const saved = session.read();
+
+    if (saved && saved.id != null) {
+        // Re-read from the database: the stored copy is only a hint, so a
+        // hand-edited session can no longer grant itself the owner role.
+        const user = await getUserById(saved.id).catch(() => null);
+        if (user && user.active !== false) {
+            state.user = { id: user.id, username: user.username, role: user.role };
+            renderApp();
+            return;
+        }
+        session.clear();
+    }
+    renderLogin();
+}
+
+async function handleLogin(form) {
+    const username = form.querySelector('#username').value;
+    const password = form.querySelector('#password').value;
+    const errorEl = form.querySelector('#login-error');
+    errorEl.textContent = '';
 
     try {
         const user = await authenticateUser(username, password);
-        if (user) {
-            currentUser = user;
-            sessionStorage.setItem('currentUser', JSON.stringify(user));
-            showApp();
-        } else {
-            document.getElementById('login-error').textContent = 'Invalid credentials';
+        if (!user) {
+            errorEl.textContent = 'That username and password do not match an account.';
+            return;
         }
+        state.user = { id: user.id, username: user.username, role: user.role };
+        session.write(state.user);
+        renderApp();
     } catch (error) {
-        document.getElementById('login-error').textContent = 'Login failed';
-        console.error('Login error:', error);
+        console.error(error);
+        errorEl.textContent = 'Sign in failed. Reload the page and try again.';
     }
 }
 
 function logout() {
-    if (confirm('Are you sure you want to logout?')) {
-        currentUser = null;
-        sessionStorage.removeItem('currentUser');
-        cart = [];
-        checkLogin();
-    }
+    if (!confirm('Sign out now?')) return;
+    state.user = null;
+    state.cart = [];
+    session.clear();
+    renderLogin();
 }
 
-// ============ APP DISPLAY ============
-async function showApp() {
-    const htmlContent = await generateAppHTML();
-    document.body.innerHTML = htmlContent;
-    setupEventListeners();
-    updateUserInfo();
-    
-    // Show appropriate interface based on role
-    if (currentUser.role === 'owner') {
-        showPage('dashboard');
-    } else {
-        showPage('pos');
-    }
-    
-    await loadDashboardData();
+/* ------------------------------------------------------------
+   Screens
+   ------------------------------------------------------------ */
+function renderLogin() {
+    document.body.classList.remove('nav-open');
+    document.getElementById('app').innerHTML = `
+        <div class="screen">
+            <form class="card login" id="login-form" novalidate>
+                <p class="brand-mark">${esc(state.settings.shopName || 'F&B Shop Manager')}</p>
+                <h1>Sign in to the counter</h1>
+                <label class="field">
+                    <span>Username</span>
+                    <input type="text" id="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+                </label>
+                <label class="field">
+                    <span>Password</span>
+                    <input type="password" id="password" autocomplete="current-password" required>
+                </label>
+                <button type="submit" class="btn btn-primary btn-block">Sign in</button>
+                <p class="error" id="login-error" role="alert"></p>
+                <p class="hint">First run? Use <b>owner</b> / <b>owner123</b> or <b>staff</b> / <b>staff123</b>, then change both in People.</p>
+            </form>
+        </div>`;
+    const field = document.getElementById('username');
+    if (field) field.focus();
 }
 
-async function generateAppHTML() {
-    return `
-        <div class="app-wrapper">
-            <aside class="sidebar">
-                <div class="logo">
-                    <h1>🍽️ F&B</h1>
+function allowedPages() {
+    return Object.entries(PAGES).filter(([, page]) => page.roles.includes(state.user.role));
+}
+
+function renderApp() {
+    const nav = allowedPages().map(([id, page]) => `
+        <button type="button" class="nav-item" data-action="nav" data-page="${id}">
+            <span class="nav-icon" aria-hidden="true">${page.icon}</span>
+            <span class="nav-label">${esc(page.label)}</span>
+        </button>`).join('');
+
+    document.getElementById('app').innerHTML = `
+        <div class="layout">
+            <button type="button" class="nav-scrim" data-action="close-nav" tabindex="-1" aria-label="Close menu"></button>
+            <aside class="sidebar" id="sidebar">
+                <div class="brand">
+                    <span class="brand-dot" aria-hidden="true"></span>
+                    <span class="brand-name">${esc(state.settings.shopName || 'F&B Shop')}</span>
                 </div>
-                <nav class="menu" id="main-menu">
-                    ${currentUser.role === 'owner' ? `
-                        <button class="menu-btn active" data-page="dashboard">📊 Dashboard</button>
-                        <button class="menu-btn" data-page="orders">🛒 Orders</button>
-                        <button class="menu-btn" data-page="menu">📋 Menu</button>
-                        <button class="menu-btn" data-page="inventory">📦 Inventory</button>
-                        <button class="menu-btn" data-page="reports">📈 Reports</button>
-                        <button class="menu-btn" data-page="users">👥 Users</button>
-                        <button class="menu-btn" data-page="settings">⚙️ Settings</button>
-                    ` : `
-                        <button class="menu-btn active" data-page="pos">🛍️ POS</button>
-                        <button class="menu-btn" data-page="staff-orders">📋 Orders</button>
-                        <button class="menu-btn" data-page="staff-reports">📊 Reports</button>
-                    `}
-                </nav>
-                <div class="user-info">
-                    <p><strong id="user-name">User</strong></p>
-                    <p id="user-role">Role</p>
-                    <div class="role">
-                        ${currentUser.role === 'owner' ? '👑 Owner' : '👨‍💼 Staff'}
-                    </div>
-                    <button class="logout-btn" onclick="logout()">Logout</button>
+                <nav class="nav" aria-label="Sections">${nav}</nav>
+                <div class="who">
+                    <p class="who-name">${esc(state.user.username)}</p>
+                    <p class="who-role">${state.user.role === 'owner' ? 'Owner' : 'Staff'}</p>
+                    <button type="button" class="btn btn-quiet btn-block" data-action="logout">Sign out</button>
                 </div>
             </aside>
-
-            <main class="main-content">
-                <header class="header">
-                    <h2 id="page-title">Dashboard</h2>
-                    <div class="header-right" id="current-date"></div>
+            <div class="main">
+                <header class="topbar">
+                    <button type="button" class="icon-btn" data-action="toggle-nav" aria-label="Open menu" aria-controls="sidebar">☰</button>
+                    <h1 id="page-title">Dashboard</h1>
+                    <span class="topbar-date">${esc(formatDate(new Date()))}</span>
                 </header>
+                <main class="page" id="page-body" tabindex="-1"></main>
+            </div>
+        </div>`;
 
-                ${currentUser.role === 'owner' ? await generateOwnerPages() : await generateStaffPages()}
-            </main>
-        </div>
-    `;
+    navigate(state.user.role === 'owner' ? 'dashboard' : 'pos');
 }
 
-async function generateOwnerPages() {
+async function navigate(pageId) {
+    const page = PAGES[pageId];
+    if (!page || !page.roles.includes(state.user.role)) return;
+
+    state.page = pageId;
+    document.body.classList.remove('nav-open');
+    document.querySelectorAll('.nav-item').forEach((btn) => {
+        btn.classList.toggle('is-active', btn.dataset.page === pageId);
+    });
+    document.getElementById('page-title').textContent = page.title;
+
+    const body = document.getElementById('page-body');
+    body.innerHTML = '<p class="muted pad">Loading…</p>';
+
+    try {
+        const renderers = {
+            dashboard: renderDashboard,
+            pos: renderPOS,
+            orders: renderOrders,
+            menu: renderMenu,
+            inventory: renderInventory,
+            reports: renderReports,
+            users: renderUsers,
+            settings: renderSettings
+        };
+        body.innerHTML = await renderers[pageId]();
+        if (pageId === 'pos') updateCart();
+        if (pageId === 'reports') await runReport();
+    } catch (error) {
+        console.error(error);
+        body.innerHTML = `<div class="card notice"><h2>This section could not load</h2><p>${esc(error.message)}</p></div>`;
+    }
+}
+
+/* ------------------------------------------------------------
+   Dashboard
+   ------------------------------------------------------------ */
+async function renderDashboard() {
+    const today = isoDate(new Date());
+    const [orders, menu, lowStock] = await Promise.all([
+        getOrdersByDateRange(today, today),
+        getAllMenuItems(),
+        getLowStockItems()
+    ]);
+
+    const sales = orders.reduce((sum, order) => sum + Number(order.totalAmount || 0), 0);
+    const recent = [...orders].sort(byNewest).slice(0, 8);
+
     return `
-        <!-- Dashboard Page -->
-        <section id="dashboard" class="page active">
-            <div class="dashboard-grid">
-                <div class="stat-card">
-                    <h3>Today's Sales</h3>
-                    <p class="stat-value" id="today-sales">₹0</p>
-                </div>
-                <div class="stat-card">
-                    <h3>Total Orders</h3>
-                    <p class="stat-value" id="today-orders">0</p>
-                </div>
-                <div class="stat-card">
-                    <h3>Menu Items</h3>
-                    <p class="stat-value" id="menu-count">0</p>
-                </div>
-                <div class="stat-card">
-                    <h3>Low Stock</h3>
-                    <p class="stat-value warning" id="low-stock">0</p>
-                </div>
-            </div>
-            <div class="dashboard-content">
-                <h3>Recent Orders</h3>
-                <div id="recent-orders-list" class="orders-table"></div>
-            </div>
+        <div class="stats">
+            ${statCard('Sales today', money(sales))}
+            ${statCard('Orders today', String(orders.length))}
+            ${statCard('Items on the menu', String(menu.filter((m) => m.available !== false).length))}
+            ${statCard('Below minimum stock', String(lowStock.length), lowStock.length ? 'warn' : '')}
+        </div>
+
+        <section class="card">
+            <div class="card-head"><h2>Today's orders</h2></div>
+            ${recent.length ? table(
+                ['Order', 'Customer', 'Type', 'Taken by', 'Total', 'Time'],
+                recent.map((o) => [
+                    `#${o.id}`,
+                    esc(o.customerName),
+                    esc(o.orderType),
+                    esc(o.createdBy),
+                    `<span class="num">${money(o.totalAmount)}</span>`,
+                    esc(formatTime(o.date))
+                ])
+            ) : empty('No sales yet today. Open New sale to ring one up.')}
         </section>
 
-        <!-- Orders Page -->
-        <section id="orders" class="page">
-            <div class="page-header">
-                <h2>All Orders</h2>
-                <button class="btn btn-primary" onclick="showNewOrderForm()">+ New Order</button>
-            </div>
-            <div id="orders-list" class="orders-table"></div>
-        </section>
-
-        <!-- Menu Items Page -->
-        <section id="menu" class="page">
-            <div class="page-header">
-                <h2>Menu Management</h2>
-                <button class="btn btn-primary" onclick="showNewMenuForm()">+ Add Item</button>
-            </div>
-            <div id="menu-form" class="form-container" style="display: none;"></div>
-            <div id="menu-list" class="menu-grid"></div>
-        </section>
-
-        <!-- Inventory Page -->
-        <section id="inventory" class="page">
-            <div class="page-header">
-                <h2>Inventory</h2>
-                <button class="btn btn-primary" onclick="showNewInventoryForm()">+ Add Stock</button>
-            </div>
-            <div id="inventory-form" class="form-container" style="display: none;"></div>
-            <div id="inventory-list" class="inventory-table"></div>
-        </section>
-
-        <!-- Reports Page -->
-        <section id="reports" class="page">
-            <div class="page-header">
-                <h2>Sales Reports</h2>
-            </div>
-            <div class="report-filters">
-                <div class="filter-group">
-                    <label>Start Date</label>
-                    <input type="date" id="report-start-date">
-                    <label>End Date</label>
-                    <input type="date" id="report-end-date">
-                    <button class="btn btn-primary" onclick="generateReport()">Filter</button>
-                </div>
-            </div>
-            <div class="report-cards">
-                <div class="stat-card">
-                    <h3>Total Sales</h3>
-                    <p class="stat-value" id="report-total-sales">₹0</p>
-                </div>
-                <div class="stat-card">
-                    <h3>Total Orders</h3>
-                    <p class="stat-value" id="report-total-orders">0</p>
-                </div>
-                <div class="stat-card">
-                    <h3>Average Order Value</h3>
-                    <p class="stat-value" id="report-avg-order">₹0</p>
-                </div>
-            </div>
-            <div class="report-section">
-                <h3>Category-wise Sales</h3>
-                <div id="category-sales" class="table-container"></div>
-            </div>
-            <div class="report-section">
-                <h3>Daily Sales</h3>
-                <div id="daily-sales" class="table-container"></div>
-            </div>
-            <button class="btn btn-secondary" onclick="exportReportCSV()">📥 Export CSV</button>
-        </section>
-
-        <!-- Users Management Page -->
-        <section id="users" class="page">
-            <div class="page-header">
-                <h2>User Management</h2>
-                <button class="btn btn-primary" onclick="showNewUserForm()">+ Add User</button>
-            </div>
-            <div id="user-form" class="form-container" style="display: none;"></div>
-            <div id="users-list" class="orders-table"></div>
-        </section>
-
-        <!-- Settings Page -->
-        <section id="settings" class="page">
-            <div class="settings-section">
-                <h3>Shop Information</h3>
-                <form id="settings-form">
-                    <div class="form-group">
-                        <label>Shop Name</label>
-                        <input type="text" id="shop-name" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Owner Name</label>
-                        <input type="text" id="owner-name" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Phone</label>
-                        <input type="tel" id="shop-phone" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Currency Symbol</label>
-                        <input type="text" id="currency-symbol" value="₹" required>
-                    </div>
-                    <button type="submit" class="btn btn-primary">Save Settings</button>
-                </form>
-            </div>
-            <div class="settings-section danger">
-                <h3>Data Management</h3>
-                <button class="btn btn-warning" onclick="exportData()">📤 Export Data</button>
-                <button class="btn btn-warning" onclick="importDataFile()">📥 Import Data</button>
-                <input type="file" id="import-file" accept=".json" style="display: none;">
-                <button class="btn btn-danger" onclick="resetAllData()">🗑️ Clear All</button>
-            </div>
-        </section>
-    `;
+        <section class="card">
+            <div class="card-head"><h2>Stock to reorder</h2></div>
+            ${lowStock.length ? table(
+                ['Item', 'In stock', 'Minimum'],
+                lowStock.map((item) => [
+                    esc(item.itemName),
+                    `<span class="num">${num(item.quantity)} ${esc(item.unit)}</span>`,
+                    `<span class="num">${num(item.minLevel)} ${esc(item.unit)}</span>`
+                ])
+            ) : empty('Every tracked item is above its minimum level.')}
+        </section>`;
 }
 
-async function generateStaffPages() {
+function statCard(label, value, tone = '') {
+    return `<div class="stat ${tone}"><p class="stat-label">${esc(label)}</p><p class="stat-value num">${value}</p></div>`;
+}
+
+/* ------------------------------------------------------------
+   Point of sale
+   ------------------------------------------------------------ */
+async function renderPOS() {
+    state.menu = (await getAllMenuItems()).filter((item) => item.available !== false);
+    const categories = ['All', ...new Set(state.menu.map((item) => item.category))];
+    if (!categories.includes(state.posCategory)) state.posCategory = 'All';
+
     return `
-        <!-- POS Page -->
-        <section id="pos" class="page active">
-            <div class="pos-container">
-                <div class="pos-menu-section">
-                    <h3>Menu Items</h3>
-                    <div class="pos-categories" id="pos-categories"></div>
-                    <div class="pos-items" id="pos-items"></div>
+        <div class="pos">
+            <section class="card pos-catalogue">
+                <div class="card-head">
+                    <h2>Menu</h2>
+                    <input type="search" id="pos-search" class="search" placeholder="Search items" value="${esc(state.posSearch)}" autocomplete="off">
                 </div>
-                <div class="pos-cart-section">
-                    <h3>Order</h3>
-                    <div class="form-group">
-                        <label>Customer Name</label>
-                        <input type="text" id="pos-customer" placeholder="Enter name">
-                    </div>
-                    <div class="form-group">
-                        <label>Order Type</label>
-                        <select id="pos-order-type">
-                            <option>Dine-in</option>
-                            <option>Takeaway</option>
-                            <option>Delivery</option>
-                        </select>
-                    </div>
-                    <div class="cart-items" id="cart-items"></div>
-                    <div class="cart-summary">
-                        <div class="cart-row">
-                            <span>Subtotal:</span>
-                            <span>₹<span id="subtotal">0</span></span>
-                        </div>
-                        <div class="cart-row">
-                            <span>Tax (0%):</span>
-                            <span>₹<span id="tax">0</span></span>
-                        </div>
-                        <div class="cart-row total">
-                            <span>Total:</span>
-                            <span>₹<span id="cart-total">0</span></span>
-                        </div>
-                    </div>
-                    <div class="checkout-section">
-                        <div class="form-group">
-                            <label>Payment Method</label>
-                            <select id="pos-payment" required>
-                                <option>Cash</option>
-                                <option>Card</option>
-                                <option>UPI</option>
-                            </select>
-                        </div>
-                        <div class="checkout-buttons">
-                            <button class="checkout-buttons btn btn-checkout" onclick="completeOrder()">Complete Order</button>
-                            <button class="checkout-buttons btn btn-clear" onclick="clearCart()">Clear Cart</button>
-                        </div>
-                    </div>
+                <div class="chips" id="pos-categories">
+                    ${categories.map((cat) => `
+                        <button type="button" class="chip ${cat === state.posCategory ? 'is-active' : ''}" data-action="pos-category" data-category="${esc(cat)}">${esc(cat)}</button>
+                    `).join('')}
                 </div>
-            </div>
-        </section>
+                <div class="tiles" id="pos-items">${posItemsHTML()}</div>
+            </section>
 
-        <!-- Staff Orders Page -->
-        <section id="staff-orders" class="page">
-            <div class="page-header">
-                <h2>My Orders</h2>
-            </div>
-            <div id="staff-orders-list" class="orders-table"></div>
-        </section>
-
-        <!-- Staff Reports Page -->
-        <section id="staff-reports" class="page">
-            <div class="page-header">
-                <h2>My Sales Report</h2>
-            </div>
-            <div class="report-filters">
-                <div class="filter-group">
-                    <label>Start Date</label>
-                    <input type="date" id="staff-report-start-date">
-                    <label>End Date</label>
-                    <input type="date" id="staff-report-end-date">
-                    <button class="btn btn-primary" onclick="generateStaffReport()">Filter</button>
+            <section class="card pos-ticket">
+                <div class="card-head"><h2>Ticket</h2></div>
+                <div class="ticket-fields">
+                    <label class="field">
+                        <span>Customer</span>
+                        <input type="text" id="pos-customer" placeholder="Walk-in" autocomplete="off">
+                    </label>
+                    <label class="field">
+                        <span>Order type</span>
+                        <select id="pos-order-type">${options(ORDER_TYPES)}</select>
+                    </label>
                 </div>
-            </div>
-            <div class="report-cards">
-                <div class="stat-card">
-                    <h3>My Sales</h3>
-                    <p class="stat-value" id="staff-total-sales">₹0</p>
+                <div class="ticket-lines" id="cart-items"></div>
+                <dl class="totals">
+                    <div><dt>Subtotal</dt><dd class="num" id="cart-subtotal">${money(0)}</dd></div>
+                    <div><dt>Tax (${num(state.settings.taxRate)}%)</dt><dd class="num" id="cart-tax">${money(0)}</dd></div>
+                    <div class="totals-grand"><dt>Total</dt><dd class="num" id="cart-total">${money(0)}</dd></div>
+                </dl>
+                <label class="field">
+                    <span>Payment</span>
+                    <select id="pos-payment">${options(PAYMENT_METHODS)}</select>
+                </label>
+                <label class="field">
+                    <span>Note</span>
+                    <input type="text" id="pos-notes" placeholder="Optional" autocomplete="off">
+                </label>
+                <div class="ticket-actions">
+                    <button type="button" class="btn btn-primary" data-action="order-complete" id="complete-order">Take payment</button>
+                    <button type="button" class="btn btn-quiet" data-action="cart-clear">Clear</button>
                 </div>
-                <div class="stat-card">
-                    <h3>My Orders</h3>
-                    <p class="stat-value" id="staff-total-orders">0</p>
-                </div>
-                <div class="stat-card">
-                    <h3>Average Order Value</h3>
-                    <p class="stat-value" id="staff-avg-order">₹0</p>
-                </div>
-            </div>
-        </section>
-    `;
+            </section>
+        </div>`;
 }
 
-// ============ EVENT LISTENERS ============
-function setupEventListeners() {
-    // Menu buttons
-    document.querySelectorAll('.menu-btn').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-            document.querySelectorAll('.menu-btn').forEach(b => b.classList.remove('active'));
-            e.target.classList.add('active');
-            showPage(e.target.dataset.page);
-        });
+function posItemsHTML() {
+    const search = state.posSearch.trim().toLowerCase();
+    const items = state.menu.filter((item) => {
+        const inCategory = state.posCategory === 'All' || item.category === state.posCategory;
+        const matches = !search || item.name.toLowerCase().includes(search) || item.category.toLowerCase().includes(search);
+        return inCategory && matches;
     });
 
-    // Settings form
-    const settingsForm = document.getElementById('settings-form');
-    if (settingsForm) {
-        settingsForm.addEventListener('submit', handleSettingsSave);
-    }
-}
-
-function showPage(pageId) {
-    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-    const page = document.getElementById(pageId);
-    if (page) {
-        page.classList.add('active');
-        document.getElementById('page-title').textContent = 
-            pageId.charAt(0).toUpperCase() + pageId.slice(1).replace('-', ' ');
-        
-        // Load page-specific data
-        if (pageId === 'dashboard') loadDashboardData();
-        else if (pageId === 'orders') loadOrders();
-        else if (pageId === 'menu') loadMenuItems();
-        else if (pageId === 'inventory') loadInventory();
-        else if (pageId === 'users') loadUsers();
-        else if (pageId === 'reports') generateReport();
-        else if (pageId === 'pos') loadPOSMenu();
-        else if (pageId === 'staff-orders') loadStaffOrders();
-        else if (pageId === 'staff-reports') generateStaffReport();
-    }
-}
-
-function updateUserInfo() {
-    const nameEl = document.getElementById('user-name');
-    const roleEl = document.getElementById('user-role');
-    if (nameEl) nameEl.textContent = currentUser.username || 'User';
-    if (roleEl) roleEl.textContent = currentUser.role || 'User';
-    updateCurrentDate();
-}
-
-function updateCurrentDate() {
-    const dateEl = document.getElementById('current-date');
-    if (dateEl) {
-        const options = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' };
-        dateEl.textContent = new Date().toLocaleDateString('en-IN', options);
-    }
-}
-
-// ============ DASHBOARD ============
-async function loadDashboardData() {
-    const today = new Date().toISOString().split('T')[0];
-    const allOrders = await getAllOrders();
-    const todayOrders = allOrders.filter(o => o.date.startsWith(today));
-    const menuItems = await getAllMenuItems();
-    const lowStock = await getLowStockItems();
-
-    const todaySales = todayOrders.reduce((sum, o) => sum + o.totalAmount, 0);
-
-    document.getElementById('today-sales').textContent = '₹' + todaySales.toFixed(2);
-    document.getElementById('today-orders').textContent = todayOrders.length;
-    document.getElementById('menu-count').textContent = menuItems.length;
-    document.getElementById('low-stock').textContent = lowStock.length;
-
-    // Recent orders
-    const recentHtml = todayOrders.slice(-5).reverse().map(o => `
-        <tr>
-            <td>${o.customerName}</td>
-            <td>${o.orderType}</td>
-            <td>₹${o.totalAmount.toFixed(2)}</td>
-            <td>${new Date(o.date).toLocaleTimeString()}</td>
-        </tr>
-    `).join('');
-
-    document.getElementById('recent-orders-list').innerHTML = recentHtml ? 
-        `<table><thead><tr><th>Customer</th><th>Type</th><th>Amount</th><th>Time</th></tr></thead><tbody>${recentHtml}</tbody></table>` :
-        '<p class="empty-state">No orders today</p>';
-}
-
-// ============ ORDERS MANAGEMENT ============
-async function loadOrders() {
-    const orders = await getAllOrders();
-    const html = orders.reverse().map(o => `
-        <tr>
-            <td>${o.customerName}</td>
-            <td>${o.orderType}</td>
-            <td>${o.items.length} items</td>
-            <td>₹${o.totalAmount.toFixed(2)}</td>
-            <td>${new Date(o.date).toLocaleDateString()}</td>
-            <td>
-                <div class="action-buttons">
-                    <button class="view-btn" onclick="viewOrder(${o.id})">View</button>
-                    <button class="delete-btn" onclick="deleteOrderAction(${o.id})">Delete</button>
-                </div>
-            </td>
-        </tr>
-    `).join('');
-
-    document.getElementById('orders-list').innerHTML = html ? 
-        `<table><thead><tr><th>Customer</th><th>Type</th><th>Items</th><th>Amount</th><th>Date</th><th>Action</th></tr></thead><tbody>${html}</tbody></table>` :
-        '<p class="empty-state">No orders</p>';
-}
-
-async function deleteOrderAction(id) {
-    if (confirm('Delete this order?')) {
-        await deleteOrder(id);
-        loadOrders();
-        showNotification('Order deleted', 'success');
-    }
-}
-
-function showNewOrderForm() {
-    alert('Use POS interface for creating orders');
-}
-
-// ============ MENU MANAGEMENT ============
-async function loadMenuItems() {
-    const items = await getAllMenuItems();
-    const html = items.map(item => `
-        <div class="menu-item">
-            <h4>${item.name}</h4>
-            <span class="category">${item.category}</span>
-            <p class="description">${item.description}</p>
-            <p class="price">₹${item.price.toFixed(2)}</p>
-            <span class="status ${item.available ? 'available' : 'unavailable'}">
-                ${item.available ? '✓ Available' : '✗ Unavailable'}
-            </span>
-            <div class="actions">
-                <button class="edit-btn" onclick="editMenuItem(${item.id})">Edit</button>
-                <button class="delete-btn" onclick="deleteMenuAction(${item.id})">Delete</button>
-            </div>
-        </div>
-    `).join('');
-
-    document.getElementById('menu-list').innerHTML = html || '<p class="empty-state">No menu items</p>';
-}
-
-function showNewMenuForm() {
-    const formHtml = `
-        <h3>Add Menu Item</h3>
-        <form onsubmit="saveMenuItem(event)">
-            <input type="hidden" id="menu-item-id">
-            <div class="form-group">
-                <label>Item Name</label>
-                <input type="text" id="item-name" required>
-            </div>
-            <div class="form-group">
-                <label>Category</label>
-                <input type="text" id="item-category" placeholder="e.g., Appetizer, Main" required>
-            </div>
-            <div class="form-group">
-                <label>Price (₹)</label>
-                <input type="number" id="item-price" step="0.01" required>
-            </div>
-            <div class="form-group">
-                <label>Description</label>
-                <textarea id="item-description" rows="3"></textarea>
-            </div>
-            <div class="form-group">
-                <label><input type="checkbox" id="item-available" checked> Available</label>
-            </div>
-            <div class="form-actions">
-                <button type="submit" class="btn btn-primary">Save</button>
-                <button type="button" class="btn btn-secondary" onclick="closeMenuForm()">Cancel</button>
-            </div>
-        </form>
-    `;
-    document.getElementById('menu-form').innerHTML = formHtml;
-    document.getElementById('menu-form').style.display = 'block';
-}
-
-async function editMenuItem(id) {
-    const item = await getMenuItem(id);
-    document.getElementById('menu-item-id').value = id;
-    document.getElementById('item-name').value = item.name;
-    document.getElementById('item-category').value = item.category;
-    document.getElementById('item-price').value = item.price;
-    document.getElementById('item-description').value = item.description;
-    document.getElementById('item-available').checked = item.available;
-    showNewMenuForm();
-}
-
-async function saveMenuItem(e) {
-    e.preventDefault();
-    const id = document.getElementById('menu-item-id').value;
-    const itemData = {
-        name: document.getElementById('item-name').value,
-        category: document.getElementById('item-category').value,
-        price: document.getElementById('item-price').value,
-        description: document.getElementById('item-description').value,
-        available: document.getElementById('item-available').checked
-    };
-
-    try {
-        if (id) {
-            await updateMenuItem(id, itemData);
-            showNotification('Item updated', 'success');
-        } else {
-            await createMenuItem(itemData);
-            showNotification('Item created', 'success');
-        }
-        closeMenuForm();
-        loadMenuItems();
-    } catch (error) {
-        showNotification('Error saving item', 'error');
-    }
-}
-
-function closeMenuForm() {
-    document.getElementById('menu-form').style.display = 'none';
-    document.getElementById('menu-item-id').value = '';
-}
-
-async function deleteMenuAction(id) {
-    if (confirm('Delete this menu item?')) {
-        await deleteMenuItem(id);
-        loadMenuItems();
-        showNotification('Item deleted', 'success');
-    }
-}
-
-// ============ INVENTORY MANAGEMENT ============
-async function loadInventory() {
-    const items = await getAllInventory();
-    const html = items.map(item => {
-        const isLow = item.quantity <= item.minLevel;
-        return `
-            <tr>
-                <td>${item.itemName}</td>
-                <td>${item.quantity} ${item.unit}</td>
-                <td>₹${item.costPrice.toFixed(2)}</td>
-                <td>${item.minLevel} ${item.unit}</td>
-                <td><span class="status ${isLow ? 'unavailable' : 'available'}">${isLow ? 'Low Stock' : 'OK'}</span></td>
-                <td>
-                    <div class="action-buttons">
-                        <button class="edit-btn" onclick="editInventory(${item.id})">Edit</button>
-                        <button class="delete-btn" onclick="deleteInventoryAction(${item.id})">Delete</button>
-                    </div>
-                </td>
-            </tr>
-        `;
-    }).join('');
-
-    document.getElementById('inventory-list').innerHTML = html ? 
-        `<table><thead><tr><th>Item</th><th>Qty</th><th>Cost</th><th>Min Level</th><th>Status</th><th>Action</th></tr></thead><tbody>${html}</tbody></table>` :
-        '<p class="empty-state">No inventory items</p>';
-}
-
-function showNewInventoryForm() {
-    const formHtml = `
-        <h3>Add/Update Inventory</h3>
-        <form onsubmit="saveInventory(event)">
-            <input type="hidden" id="inventory-id">
-            <div class="form-group">
-                <label>Item Name</label>
-                <input type="text" id="inv-item-name" required>
-            </div>
-            <div class="form-group">
-                <label>Quantity</label>
-                <input type="number" id="inv-quantity" required>
-            </div>
-            <div class="form-group">
-                <label>Unit</label>
-                <input type="text" id="inv-unit" placeholder="e.g., kg, litre" required>
-            </div>
-            <div class="form-group">
-                <label>Cost Price (₹)</label>
-                <input type="number" id="inv-cost-price" step="0.01" required>
-            </div>
-            <div class="form-group">
-                <label>Minimum Stock Level</label>
-                <input type="number" id="inv-min-level" required>
-            </div>
-            <div class="form-actions">
-                <button type="submit" class="btn btn-primary">Save</button>
-                <button type="button" class="btn btn-secondary" onclick="closeInventoryForm()">Cancel</button>
-            </div>
-        </form>
-    `;
-    document.getElementById('inventory-form').innerHTML = formHtml;
-    document.getElementById('inventory-form').style.display = 'block';
-}
-
-async function editInventory(id) {
-    const item = await getInventoryItem(id);
-    document.getElementById('inventory-id').value = id;
-    document.getElementById('inv-item-name').value = item.itemName;
-    document.getElementById('inv-quantity').value = item.quantity;
-    document.getElementById('inv-unit').value = item.unit;
-    document.getElementById('inv-cost-price').value = item.costPrice;
-    document.getElementById('inv-min-level').value = item.minLevel;
-    showNewInventoryForm();
-}
-
-async function saveInventory(e) {
-    e.preventDefault();
-    const id = document.getElementById('inventory-id').value;
-    const itemData = {
-        itemName: document.getElementById('inv-item-name').value,
-        quantity: document.getElementById('inv-quantity').value,
-        unit: document.getElementById('inv-unit').value,
-        costPrice: document.getElementById('inv-cost-price').value,
-        minLevel: document.getElementById('inv-min-level').value
-    };
-
-    try {
-        if (id) {
-            await updateInventoryItem(id, itemData);
-            showNotification('Inventory updated', 'success');
-        } else {
-            await createInventoryItem(itemData);
-            showNotification('Item added', 'success');
-        }
-        closeInventoryForm();
-        loadInventory();
-    } catch (error) {
-        showNotification('Error saving inventory', 'error');
-    }
-}
-
-function closeInventoryForm() {
-    document.getElementById('inventory-form').style.display = 'none';
-    document.getElementById('inventory-id').value = '';
-}
-
-async function deleteInventoryAction(id) {
-    if (confirm('Delete this inventory item?')) {
-        await deleteInventoryItem(id);
-        loadInventory();
-        showNotification('Item deleted', 'success');
-    }
-}
-
-// ============ USER MANAGEMENT (OWNER ONLY) ============
-async function loadUsers() {
-    const users = await getAllUsers();
-    const html = users.map(u => `
-        <tr>
-            <td>${u.username}</td>
-            <td>${u.email}</td>
-            <td>${u.role}</td>
-            <td>${u.active ? '✓' : '✗'}</td>
-            <td>
-                <div class="action-buttons">
-                    <button class="edit-btn" onclick="editUser(${u.id})">Edit</button>
-                    <button class="delete-btn" onclick="deleteUserAction(${u.id})">Delete</button>
-                </div>
-            </td>
-        </tr>
-    `).join('');
-
-    document.getElementById('users-list').innerHTML = html ? 
-        `<table><thead><tr><th>Username</th><th>Email</th><th>Role</th><th>Active</th><th>Action</th></tr></thead><tbody>${html}</tbody></table>` :
-        '<p class="empty-state">No users</p>';
-}
-
-function showNewUserForm() {
-    const formHtml = `
-        <h3>Add User</h3>
-        <form onsubmit="saveUser(event)">
-            <input type="hidden" id="user-id">
-            <div class="form-group">
-                <label>Username</label>
-                <input type="text" id="user-username" required>
-            </div>
-            <div class="form-group">
-                <label>Email</label>
-                <input type="email" id="user-email" required>
-            </div>
-            <div class="form-group">
-                <label>Password</label>
-                <input type="password" id="user-password">
-            </div>
-            <div class="form-group">
-                <label>Role</label>
-                <select id="user-role" required>
-                    <option value="staff">Staff</option>
-                    <option value="owner">Owner</option>
-                </select>
-            </div>
-            <div class="form-actions">
-                <button type="submit" class="btn btn-primary">Save</button>
-                <button type="button" class="btn btn-secondary" onclick="closeUserForm()">Cancel</button>
-            </div>
-        </form>
-    `;
-    document.getElementById('user-form').innerHTML = formHtml;
-    document.getElementById('user-form').style.display = 'block';
-}
-
-async function editUser(id) {
-    const user = await getUser(user.username);
-    if (user) {
-        document.getElementById('user-id').value = id;
-        document.getElementById('user-username').value = user.username;
-        document.getElementById('user-email').value = user.email;
-        document.getElementById('user-role').value = user.role;
-        showNewUserForm();
-    }
-}
-
-async function saveUser(e) {
-    e.preventDefault();
-    const id = document.getElementById('user-id').value;
-    const userData = {
-        username: document.getElementById('user-username').value,
-        email: document.getElementById('user-email').value,
-        role: document.getElementById('user-role').value
-    };
-
-    if (document.getElementById('user-password').value) {
-        userData.password = document.getElementById('user-password').value;
+    if (!items.length) {
+        if (state.menu.length) return empty('Nothing matches that search.');
+        return empty(state.user.role === 'owner'
+            ? 'No items are available yet. Add them under Menu.'
+            : 'No items are available yet. Ask an owner to add them.');
     }
 
-    try {
-        if (id) {
-            await updateUser(id, userData);
-            showNotification('User updated', 'success');
-        } else {
-            await createUser(userData);
-            showNotification('User created', 'success');
-        }
-        closeUserForm();
-        loadUsers();
-    } catch (error) {
-        showNotification('Error saving user', 'error');
-    }
+    return items.map((item) => `
+        <button type="button" class="tile" data-action="pos-add" data-id="${item.id}">
+            <span class="tile-name">${esc(item.name)}</span>
+            <span class="tile-meta">${esc(item.category)}</span>
+            <span class="tile-price num">${money(item.price)}</span>
+        </button>`).join('');
 }
 
-function closeUserForm() {
-    document.getElementById('user-form').style.display = 'none';
-    document.getElementById('user-id').value = '';
+function refreshPOSItems() {
+    const container = document.getElementById('pos-items');
+    if (container) container.innerHTML = posItemsHTML();
 }
 
-async function deleteUserAction(id) {
-    if (confirm('Delete this user?')) {
-        await deleteUser(id);
-        loadUsers();
-        showNotification('User deleted', 'success');
-    }
-}
-
-// ============ REPORTS (OWNER) ============
-async function generateReport() {
-    const startDate = document.getElementById('report-start-date').value || new Date().toISOString().split('T')[0];
-    const endDate = document.getElementById('report-end-date').value || new Date().toISOString().split('T')[0];
-
-    const allOrders = await getAllOrders();
-    const orders = allOrders.filter(o => o.date.startsWith(startDate) || o.date.startsWith(endDate) || 
-                                         (o.date >= startDate && o.date <= endDate));
-
-    const totalSales = orders.reduce((sum, o) => sum + o.totalAmount, 0);
-    const avgOrder = orders.length > 0 ? totalSales / orders.length : 0;
-
-    document.getElementById('report-total-sales').textContent = '₹' + totalSales.toFixed(2);
-    document.getElementById('report-total-orders').textContent = orders.length;
-    document.getElementById('report-avg-order').textContent = '₹' + avgOrder.toFixed(2);
-
-    // Category-wise sales
-    const categorySales = {};
-    orders.forEach(o => {
-        o.items.forEach(item => {
-            if (!categorySales[item.category]) {
-                categorySales[item.category] = { count: 0, total: 0 };
-            }
-            categorySales[item.category].count += item.quantity || 1;
-            categorySales[item.category].total += item.price * (item.quantity || 1);
-        });
-    });
-
-    const categoryHtml = Object.entries(categorySales).map(([cat, data]) => `
-        <tr>
-            <td>${cat}</td>
-            <td>${data.count}</td>
-            <td>₹${data.total.toFixed(2)}</td>
-        </tr>
-    `).join('');
-
-    document.getElementById('category-sales').innerHTML = categoryHtml ? 
-        `<table><thead><tr><th>Category</th><th>Items Sold</th><th>Total</th></tr></thead><tbody>${categoryHtml}</tbody></table>` :
-        '<p class="empty-state">No data</p>';
-
-    // Daily sales
-    const dailySales = {};
-    orders.forEach(o => {
-        const date = o.date.split('T')[0];
-        if (!dailySales[date]) dailySales[date] = 0;
-        dailySales[date] += o.totalAmount;
-    });
-
-    const dailyHtml = Object.entries(dailySales).map(([date, total]) => `
-        <tr>
-            <td>${new Date(date).toLocaleDateString()}</td>
-            <td>₹${total.toFixed(2)}</td>
-        </tr>
-    `).join('');
-
-    document.getElementById('daily-sales').innerHTML = dailyHtml ? 
-        `<table><thead><tr><th>Date</th><th>Sales</th></tr></thead><tbody>${dailyHtml}</tbody></table>` :
-        '<p class="empty-state">No data</p>';
-}
-
-function exportReportCSV() {
-    const startDate = document.getElementById('report-start-date').value;
-    const endDate = document.getElementById('report-end-date').value;
-    const csv = `Report from ${startDate} to ${endDate}\nGenerated: ${new Date().toLocaleString()}\n\n`;
-    
-    const totalSales = document.getElementById('report-total-sales').textContent;
-    const totalOrders = document.getElementById('report-total-orders').textContent;
-    const avgOrder = document.getElementById('report-avg-order').textContent;
-
-    const content = csv + `Total Sales,${totalSales}\nTotal Orders,${totalOrders}\nAvg Order,${avgOrder}`;
-    downloadFile(content, 'report.csv');
-}
-
-// ============ POS INTERFACE (STAFF) ============
-async function loadPOSMenu() {
-    const menuItems = await getAllMenuItems();
-    const categories = [...new Set(menuItems.map(m => m.category))];
-
-    // Categories
-    const categoryHtml = '<button class="category-btn active" onclick="filterPOSCategory(\'All\')">All</button>' +
-        categories.map(cat => `<button class="category-btn" onclick="filterPOSCategory('${cat}')">${cat}</button>`).join('');
-    document.getElementById('pos-categories').innerHTML = categoryHtml;
-
-    // Items
-    const itemsHtml = menuItems.filter(m => selectedCategory === 'All' || m.category === selectedCategory)
-        .map(item => `
-        <div class="pos-item" onclick="addToCart(${item.id}, '${item.name}', ${item.price})">
-            <h4>${item.name}</h4>
-            <p class="price">₹${item.price.toFixed(2)}</p>
-        </div>
-    `).join('');
-    document.getElementById('pos-items').innerHTML = itemsHtml || '<p class="empty-state">No items</p>';
-}
-
-function filterPOSCategory(category) {
-    selectedCategory = category;
-    document.querySelectorAll('.category-btn').forEach(b => b.classList.remove('active'));
-    event.target.classList.add('active');
-    loadPOSMenu();
-}
-
-async function addToCart(itemId, name, price) {
-    const existing = cart.find(c => c.itemId === itemId);
-    if (existing) {
-        existing.quantity++;
+function addToCart(id) {
+    const item = state.menu.find((menuItem) => menuItem.id === id);
+    if (!item) return;
+    const line = state.cart.find((entry) => entry.itemId === item.id);
+    if (line) {
+        line.quantity += 1;
     } else {
-        cart.push({ itemId, name, price, quantity: 1 });
+        state.cart.push({
+            itemId: item.id,
+            name: item.name,
+            category: item.category,
+            price: Number(item.price),
+            quantity: 1
+        });
     }
-    updateCartDisplay();
+    updateCart();
 }
 
-function updateCartDisplay() {
-    const cartItemsHtml = cart.map((item, idx) => `
-        <div class="cart-item">
-            <div class="cart-item-info">
-                <div class="cart-item-name">${item.name}</div>
-                <div class="cart-item-price">₹${(item.price * item.quantity).toFixed(2)}</div>
+function updateCart() {
+    const container = document.getElementById('cart-items');
+    if (!container) return;
+
+    container.innerHTML = state.cart.length ? state.cart.map((line, index) => `
+        <div class="ticket-line">
+            <div class="ticket-line-main">
+                <p class="ticket-line-name">${esc(line.name)}</p>
+                <p class="ticket-line-price num">${money(line.price)} each</p>
             </div>
-            <div class="cart-item-qty">
-                <button onclick="decreaseQty(${idx})">-</button>
-                <span>${item.quantity}</span>
-                <button onclick="increaseQty(${idx})">+</button>
+            <div class="stepper">
+                <button type="button" data-action="cart-dec" data-index="${index}" aria-label="One less ${esc(line.name)}">−</button>
+                <span class="num">${line.quantity}</span>
+                <button type="button" data-action="cart-inc" data-index="${index}" aria-label="One more ${esc(line.name)}">+</button>
             </div>
-            <button class="cart-item-remove" onclick="removeFromCart(${idx})">Remove</button>
-        </div>
-    `).join('');
+            <p class="ticket-line-total num">${money(line.price * line.quantity)}</p>
+            <button type="button" class="link-danger" data-action="cart-remove" data-index="${index}">Remove</button>
+        </div>`).join('') : empty('Tap an item to start the ticket.');
 
-    document.getElementById('cart-items').innerHTML = cartItemsHtml;
-
-    const subtotal = cart.reduce((sum, item) => sum + (item.price * item.quantity), 0);
-    const tax = 0;
-    const total = subtotal + tax;
-
-    document.getElementById('subtotal').textContent = subtotal.toFixed(2);
-    document.getElementById('tax').textContent = tax.toFixed(2);
-    document.getElementById('cart-total').textContent = total.toFixed(2);
-}
-
-function increaseQty(idx) {
-    cart[idx].quantity++;
-    updateCartDisplay();
-}
-
-function decreaseQty(idx) {
-    if (cart[idx].quantity > 1) {
-        cart[idx].quantity--;
-    } else {
-        removeFromCart(idx);
-    }
-    updateCartDisplay();
-}
-
-function removeFromCart(idx) {
-    cart.splice(idx, 1);
-    updateCartDisplay();
-}
-
-function clearCart() {
-    cart = [];
-    updateCartDisplay();
+    const subtotal = state.cart.reduce((sum, line) => sum + line.price * line.quantity, 0);
+    const tax = subtotal * Number(state.settings.taxRate || 0) / 100;
+    setText('cart-subtotal', money(subtotal));
+    setText('cart-tax', money(tax));
+    setText('cart-total', money(subtotal + tax));
 }
 
 async function completeOrder() {
-    if (cart.length === 0) {
-        showNotification('Cart is empty', 'warning');
+    if (!state.cart.length) {
+        toast('Add at least one item before taking payment.', 'warning');
         return;
     }
-
-    const customerName = document.getElementById('pos-customer').value || 'Walk-in';
-    const orderType = document.getElementById('pos-order-type').value;
-    const totalAmount = parseFloat(document.getElementById('cart-total').textContent);
-    const paymentMethod = document.getElementById('pos-payment').value;
+    const button = document.getElementById('complete-order');
+    if (state.submitting) return;
+    state.submitting = true;
+    if (button) button.disabled = true;
 
     try {
-        await createOrder({
-            customerName,
-            orderType,
-            items: cart,
-            totalAmount,
-            paymentMethod,
-            createdBy: currentUser.username
+        const order = await createOrder({
+            customerName: value('pos-customer'),
+            orderType: value('pos-order-type'),
+            items: state.cart,
+            taxRate: state.settings.taxRate,
+            notes: value('pos-notes'),
+            paymentMethod: value('pos-payment'),
+            createdBy: state.user.username
         });
 
-        showNotification('Order completed successfully', 'success');
-        cart = [];
-        document.getElementById('pos-customer').value = '';
-        updateCartDisplay();
-        loadPOSMenu();
+        state.cart = [];
+        setValue('pos-customer', '');
+        setValue('pos-notes', '');
+        updateCart();
+        toast(`Order #${order.id} saved — ${money(order.totalAmount)}`, 'success');
+        showReceipt(order);
     } catch (error) {
-        showNotification('Error creating order', 'error');
+        console.error(error);
+        toast(error.message || 'The order could not be saved.', 'error');
+    } finally {
+        state.submitting = false;
+        if (button) button.disabled = false;
     }
 }
 
-// ============ STAFF REPORTS ============
-async function loadStaffOrders() {
+/* ------------------------------------------------------------
+   Orders
+   ------------------------------------------------------------ */
+async function visibleOrders() {
     const orders = await getAllOrders();
-    const myOrders = orders.filter(o => o.createdBy === currentUser.username);
-
-    const html = myOrders.reverse().map(o => `
-        <tr>
-            <td>${o.customerName}</td>
-            <td>${o.orderType}</td>
-            <td>₹${o.totalAmount.toFixed(2)}</td>
-            <td>${new Date(o.date).toLocaleDateString()}</td>
-        </tr>
-    `).join('');
-
-    document.getElementById('staff-orders-list').innerHTML = html ? 
-        `<table><thead><tr><th>Customer</th><th>Type</th><th>Amount</th><th>Date</th></tr></thead><tbody>${html}</tbody></table>` :
-        '<p class="empty-state">No orders</p>';
+    const mine = state.user.role === 'owner' ? orders : orders.filter((o) => o.createdBy === state.user.username);
+    return mine.sort(byNewest);
 }
 
-async function generateStaffReport() {
-    const startDate = document.getElementById('staff-report-start-date').value || new Date().toISOString().split('T')[0];
-    const endDate = document.getElementById('staff-report-end-date').value || new Date().toISOString().split('T')[0];
+async function renderOrders() {
+    const orders = await visibleOrders();
+    const isOwner = state.user.role === 'owner';
 
-    const allOrders = await getAllOrders();
-    const myOrders = allOrders.filter(o => 
-        o.createdBy === currentUser.username && 
-        (o.date.startsWith(startDate) || o.date.startsWith(endDate) || 
-         (o.date >= startDate && o.date <= endDate))
-    );
-
-    const totalSales = myOrders.reduce((sum, o) => sum + o.totalAmount, 0);
-    const avgOrder = myOrders.length > 0 ? totalSales / myOrders.length : 0;
-
-    document.getElementById('staff-total-sales').textContent = '₹' + totalSales.toFixed(2);
-    document.getElementById('staff-total-orders').textContent = myOrders.length;
-    document.getElementById('staff-avg-order').textContent = '₹' + avgOrder.toFixed(2);
+    return `
+        <section class="card">
+            <div class="card-head">
+                <h2>${isOwner ? 'All orders' : 'My orders'}</h2>
+                <span class="muted">${orders.length} total</span>
+            </div>
+            ${orders.length ? table(
+                ['Order', 'Customer', 'Type', 'Items', 'Payment', isOwner ? 'Taken by' : 'Date', 'Total', ''],
+                orders.slice(0, 200).map((o) => [
+                    `#${o.id}`,
+                    esc(o.customerName),
+                    esc(o.orderType),
+                    String(o.items ? o.items.length : 0),
+                    esc(o.paymentMethod || 'Cash'),
+                    isOwner ? esc(o.createdBy) : esc(formatDate(o.date)),
+                    `<span class="num">${money(o.totalAmount)}</span>`,
+                    `<div class="row-actions">
+                        <button type="button" class="btn btn-tiny" data-action="order-view" data-id="${o.id}">Open</button>
+                        ${isOwner ? `<button type="button" class="btn btn-tiny btn-danger" data-action="order-delete" data-id="${o.id}">Delete</button>` : ''}
+                     </div>`
+                ])
+            ) : empty(isOwner ? 'No orders have been rung up yet.' : 'You have not taken any orders yet.')}
+            ${orders.length > 200 ? '<p class="muted pad">Showing the 200 most recent. Use Reports for older sales.</p>' : ''}
+        </section>`;
 }
 
-// ============ SETTINGS ============
-async function handleSettingsSave(e) {
-    e.preventDefault();
-    const shopName = document.getElementById('shop-name').value;
-    const ownerName = document.getElementById('owner-name').value;
-    const shopPhone = document.getElementById('shop-phone').value;
-    const currencySymbol = document.getElementById('currency-symbol').value;
+async function viewOrder(id) {
+    const order = await getOrder(id);
+    if (!order) {
+        toast('That order no longer exists.', 'error');
+        return;
+    }
+    openModal(`Order #${order.id}`, `
+        <dl class="detail">
+            <div><dt>Customer</dt><dd>${esc(order.customerName)}</dd></div>
+            <div><dt>Type</dt><dd>${esc(order.orderType)}</dd></div>
+            <div><dt>Payment</dt><dd>${esc(order.paymentMethod || 'Cash')}</dd></div>
+            <div><dt>Taken by</dt><dd>${esc(order.createdBy)}</dd></div>
+            <div><dt>Date</dt><dd>${esc(formatDateTime(order.date))}</dd></div>
+        </dl>
+        ${table(['Item', 'Qty', 'Price', 'Line total'], (order.items || []).map((item) => [
+            esc(item.name),
+            `<span class="num">${item.quantity}</span>`,
+            `<span class="num">${money(item.price)}</span>`,
+            `<span class="num">${money(item.lineTotal != null ? item.lineTotal : item.price * item.quantity)}</span>`
+        ]))}
+        <dl class="totals">
+            <div><dt>Subtotal</dt><dd class="num">${money(order.subtotal != null ? order.subtotal : order.totalAmount)}</dd></div>
+            <div><dt>Tax</dt><dd class="num">${money(order.taxAmount || 0)}</dd></div>
+            <div class="totals-grand"><dt>Total</dt><dd class="num">${money(order.totalAmount)}</dd></div>
+        </dl>
+        ${order.notes ? `<p class="muted">Note: ${esc(order.notes)}</p>` : ''}`,
+        `<button type="button" class="btn btn-quiet" data-action="order-print" data-id="${order.id}">Print receipt</button>`);
+}
 
+async function deleteOrderAction(id) {
+    if (!confirm('Delete this order? Sales reports will no longer include it.')) return;
     try {
-        await saveSetting('shopName', shopName);
-        await saveSetting('ownerName', ownerName);
-        await saveSetting('shopPhone', shopPhone);
-        await saveSetting('currencySymbol', currencySymbol);
-        showNotification('Settings saved', 'success');
+        await deleteOrder(id);
+        toast('Order deleted.', 'success');
+        navigate('orders');
     } catch (error) {
-        showNotification('Error saving settings', 'error');
+        toast(error.message, 'error');
     }
 }
 
-async function loadSettings() {
-    document.getElementById('shop-name').value = await getSetting('shopName') || '';
-    document.getElementById('owner-name').value = await getSetting('ownerName') || '';
-    document.getElementById('shop-phone').value = await getSetting('shopPhone') || '';
-    document.getElementById('currency-symbol').value = await getSetting('currencySymbol') || '₹';
+/* ------------------------------------------------------------
+   Menu
+   ------------------------------------------------------------ */
+async function renderMenu() {
+    const items = (await getAllMenuItems()).sort((a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name));
+    state.menu = items;
+    const editing = state.editing.menu;
+
+    return `
+        <div class="card-head page-head">
+            <h2>Menu</h2>
+            <button type="button" class="btn btn-primary" data-action="menu-new">Add item</button>
+        </div>
+        ${editing !== undefined ? menuForm(editing) : ''}
+        ${items.length ? `<div class="cards">${items.map(menuCard).join('')}</div>` : empty('Add your first item to start selling.')}`;
+}
+
+function menuCard(item) {
+    return `
+        <article class="card item-card ${item.available === false ? 'is-off' : ''}">
+            <p class="item-tag">${esc(item.category)}</p>
+            <h3>${esc(item.name)}</h3>
+            <p class="item-desc">${esc(item.description) || '<span class="muted">No description</span>'}</p>
+            <p class="item-price num">${money(item.price)}</p>
+            <p class="badge ${item.available === false ? 'badge-off' : 'badge-on'}">${item.available === false ? 'Not selling' : 'Selling'}</p>
+            <div class="row-actions">
+                <button type="button" class="btn btn-tiny" data-action="menu-edit" data-id="${item.id}">Edit</button>
+                <button type="button" class="btn btn-tiny btn-danger" data-action="menu-delete" data-id="${item.id}">Delete</button>
+            </div>
+        </article>`;
+}
+
+function menuForm(item) {
+    const data = item || { name: '', category: '', price: '', description: '', available: true };
+    return `
+        <form class="card form" id="menu-form" novalidate>
+            <h3>${item ? `Edit ${esc(item.name)}` : 'New menu item'}</h3>
+            <input type="hidden" id="menu-id" value="${item ? item.id : ''}">
+            <div class="form-grid">
+                <label class="field"><span>Item name</span><input type="text" id="item-name" value="${esc(data.name)}" required></label>
+                <label class="field"><span>Category</span><input type="text" id="item-category" list="category-list" value="${esc(data.category)}" placeholder="Beverages, Snacks…" required></label>
+                <label class="field"><span>Price</span><input type="number" id="item-price" min="0" step="0.01" value="${esc(data.price)}" required></label>
+            </div>
+            <label class="field"><span>Description</span><textarea id="item-description" rows="2">${esc(data.description)}</textarea></label>
+            <label class="check"><input type="checkbox" id="item-available" ${data.available === false ? '' : 'checked'}> Available to sell</label>
+            <div class="form-actions">
+                <button type="submit" class="btn btn-primary">${item ? 'Save changes' : 'Add item'}</button>
+                <button type="button" class="btn btn-quiet" data-action="menu-cancel">Cancel</button>
+            </div>
+            <datalist id="category-list">${[...new Set(state.menu.map((m) => m.category))].map((c) => `<option value="${esc(c)}"></option>`).join('')}</datalist>
+        </form>`;
+}
+
+async function submitMenuForm(form) {
+    const id = form.querySelector('#menu-id').value;
+    const payload = {
+        name: value('item-name'),
+        category: value('item-category'),
+        price: value('item-price'),
+        description: value('item-description'),
+        available: document.getElementById('item-available').checked
+    };
+    try {
+        if (id) {
+            await updateMenuItem(id, payload);
+            toast('Item updated.', 'success');
+        } else {
+            await createMenuItem(payload);
+            toast('Item added.', 'success');
+        }
+        state.editing = {};
+        await navigate('menu');
+    } catch (error) {
+        toast(error.message, 'error');
+    }
+}
+
+/* ------------------------------------------------------------
+   Stock
+   ------------------------------------------------------------ */
+async function renderInventory() {
+    const items = (await getAllInventory()).sort((a, b) => a.itemName.localeCompare(b.itemName));
+    const editing = state.editing.inventory;
+
+    return `
+        <div class="card-head page-head">
+            <h2>Stock</h2>
+            <button type="button" class="btn btn-primary" data-action="inv-new">Add stock item</button>
+        </div>
+        ${editing !== undefined ? inventoryForm(editing) : ''}
+        <section class="card">
+            ${items.length ? table(
+                ['Item', 'In stock', 'Minimum', 'Cost', 'Last restocked', 'Status', ''],
+                items.map((item) => {
+                    const low = Number(item.quantity) <= Number(item.minLevel);
+                    return [
+                        esc(item.itemName),
+                        `<span class="num">${num(item.quantity)} ${esc(item.unit)}</span>`,
+                        `<span class="num">${num(item.minLevel)} ${esc(item.unit)}</span>`,
+                        `<span class="num">${money(item.costPrice)}</span>`,
+                        esc(formatDate(item.lastRestockDate || item.createdAt)),
+                        `<span class="badge ${low ? 'badge-off' : 'badge-on'}">${low ? 'Reorder' : 'OK'}</span>`,
+                        `<div class="row-actions">
+                            <button type="button" class="btn btn-tiny" data-action="inv-edit" data-id="${item.id}">Edit</button>
+                            <button type="button" class="btn btn-tiny btn-danger" data-action="inv-delete" data-id="${item.id}">Delete</button>
+                         </div>`
+                    ];
+                })
+            ) : empty('Track ingredients here to get reorder alerts on the dashboard.')}
+        </section>`;
+}
+
+function inventoryForm(item) {
+    const data = item || { itemName: '', quantity: '', unit: '', costPrice: '', minLevel: '' };
+    return `
+        <form class="card form" id="inventory-form" novalidate>
+            <h3>${item ? `Edit ${esc(item.itemName)}` : 'New stock item'}</h3>
+            <input type="hidden" id="inventory-id" value="${item ? item.id : ''}">
+            <div class="form-grid">
+                <label class="field"><span>Item name</span><input type="text" id="inv-item-name" value="${esc(data.itemName)}" required></label>
+                <label class="field"><span>Quantity in stock</span><input type="number" id="inv-quantity" min="0" step="0.01" value="${esc(data.quantity)}" required></label>
+                <label class="field"><span>Unit</span><input type="text" id="inv-unit" value="${esc(data.unit)}" placeholder="kg, litre, pieces" required></label>
+                <label class="field"><span>Cost price</span><input type="number" id="inv-cost-price" min="0" step="0.01" value="${esc(data.costPrice)}" required></label>
+                <label class="field"><span>Reorder below</span><input type="number" id="inv-min-level" min="0" step="0.01" value="${esc(data.minLevel)}" required></label>
+            </div>
+            <div class="form-actions">
+                <button type="submit" class="btn btn-primary">${item ? 'Save changes' : 'Add stock item'}</button>
+                <button type="button" class="btn btn-quiet" data-action="inv-cancel">Cancel</button>
+            </div>
+        </form>`;
+}
+
+async function submitInventoryForm(form) {
+    const id = form.querySelector('#inventory-id').value;
+    const payload = {
+        itemName: value('inv-item-name'),
+        quantity: value('inv-quantity'),
+        unit: value('inv-unit'),
+        costPrice: value('inv-cost-price'),
+        minLevel: value('inv-min-level')
+    };
+    try {
+        if (id) {
+            await updateInventoryItem(id, payload);
+            toast('Stock updated.', 'success');
+        } else {
+            await createInventoryItem(payload);
+            toast('Stock item added.', 'success');
+        }
+        state.editing = {};
+        await navigate('inventory');
+    } catch (error) {
+        toast(error.message, 'error');
+    }
+}
+
+/* ------------------------------------------------------------
+   People
+   ------------------------------------------------------------ */
+async function renderUsers() {
+    const users = (await getAllUsers()).sort((a, b) => a.username.localeCompare(b.username));
+    const editing = state.editing.user;
+
+    return `
+        <div class="card-head page-head">
+            <h2>People</h2>
+            <button type="button" class="btn btn-primary" data-action="user-new">Add person</button>
+        </div>
+        ${editing !== undefined ? userForm(editing) : ''}
+        <section class="card">
+            ${table(
+                ['Username', 'Email', 'Role', 'Status', 'Added', ''],
+                users.map((user) => [
+                    esc(user.username) + (user.id === state.user.id ? ' <span class="muted">(you)</span>' : ''),
+                    esc(user.email) || '<span class="muted">—</span>',
+                    user.role === 'owner' ? 'Owner' : 'Staff',
+                    `<span class="badge ${user.active === false ? 'badge-off' : 'badge-on'}">${user.active === false ? 'Disabled' : 'Active'}</span>`,
+                    esc(formatDate(user.createdAt)),
+                    `<div class="row-actions">
+                        <button type="button" class="btn btn-tiny" data-action="user-edit" data-id="${user.id}">Edit</button>
+                        ${user.id === state.user.id ? '' : `<button type="button" class="btn btn-tiny btn-danger" data-action="user-delete" data-id="${user.id}">Delete</button>`}
+                     </div>`
+                ])
+            )}
+        </section>`;
+}
+
+function userForm(user) {
+    const data = user || { username: '', email: '', role: 'staff', active: true };
+    return `
+        <form class="card form" id="user-form" novalidate>
+            <h3>${user ? `Edit ${esc(user.username)}` : 'New person'}</h3>
+            <input type="hidden" id="user-id" value="${user ? user.id : ''}">
+            <div class="form-grid">
+                <label class="field"><span>Username</span><input type="text" id="user-username" value="${esc(data.username)}" autocapitalize="none" spellcheck="false" required></label>
+                <label class="field"><span>Email</span><input type="email" id="user-email" value="${esc(data.email)}"></label>
+                <label class="field"><span>Role</span>
+                    <select id="user-role">
+                        <option value="staff" ${data.role === 'staff' ? 'selected' : ''}>Staff — sells and sees their own sales</option>
+                        <option value="owner" ${data.role === 'owner' ? 'selected' : ''}>Owner — full access</option>
+                    </select>
+                </label>
+                <label class="field">
+                    <span>${user ? 'New password (leave blank to keep)' : 'Password'}</span>
+                    <input type="password" id="user-password" autocomplete="new-password" ${user ? '' : 'required'}>
+                </label>
+            </div>
+            <label class="check"><input type="checkbox" id="user-active" ${data.active === false ? '' : 'checked'}> Can sign in</label>
+            <div class="form-actions">
+                <button type="submit" class="btn btn-primary">${user ? 'Save changes' : 'Add person'}</button>
+                <button type="button" class="btn btn-quiet" data-action="user-cancel">Cancel</button>
+            </div>
+        </form>`;
+}
+
+async function submitUserForm(form) {
+    const id = form.querySelector('#user-id').value;
+    const payload = {
+        username: value('user-username'),
+        email: value('user-email'),
+        role: value('user-role'),
+        active: document.getElementById('user-active').checked,
+        password: value('user-password')
+    };
+    try {
+        if (id) {
+            await updateUser(id, payload);
+            toast('Account updated.', 'success');
+            if (Number(id) === state.user.id) {
+                state.user.username = payload.username.toLowerCase();
+                state.user.role = payload.role;
+                session.write(state.user);
+            }
+        } else {
+            await createUser(payload);
+            toast('Account created.', 'success');
+        }
+        state.editing = {};
+        await navigate('users');
+    } catch (error) {
+        toast(error.message, 'error');
+    }
+}
+
+async function deleteUserAction(id) {
+    if (!confirm('Delete this account? Their past orders stay in the reports.')) return;
+    try {
+        await deleteUser(id);
+        toast('Account deleted.', 'success');
+        await navigate('users');
+    } catch (error) {
+        toast(error.message, 'error');
+    }
+}
+
+/* ------------------------------------------------------------
+   Reports
+   ------------------------------------------------------------ */
+function renderReports() {
+    const today = isoDate(new Date());
+    const mine = state.user.role !== 'owner';
+    return `
+        <section class="card">
+            <div class="card-head">
+                <h2>${mine ? 'My sales' : 'Sales'}</h2>
+                <div class="chips">
+                    <button type="button" class="chip" data-action="report-preset" data-range="today">Today</button>
+                    <button type="button" class="chip" data-action="report-preset" data-range="week">Last 7 days</button>
+                    <button type="button" class="chip" data-action="report-preset" data-range="month">This month</button>
+                </div>
+            </div>
+            <div class="filters">
+                <label class="field"><span>From</span><input type="date" id="report-start" value="${today}" max="${today}"></label>
+                <label class="field"><span>To</span><input type="date" id="report-end" value="${today}" max="${today}"></label>
+                <button type="button" class="btn btn-primary" data-action="report-run">Show</button>
+                <button type="button" class="btn btn-quiet" data-action="report-csv">Download CSV</button>
+            </div>
+        </section>
+        <div class="stats" id="report-stats"></div>
+        <section class="card"><div class="card-head"><h2>By category</h2></div><div id="report-categories"></div></section>
+        <section class="card"><div class="card-head"><h2>By day</h2></div><div id="report-days"></div></section>
+        <section class="card"><div class="card-head"><h2>Best sellers</h2></div><div id="report-items"></div></section>`;
+}
+
+async function reportOrders() {
+    const start = value('report-start') || isoDate(new Date());
+    const end = value('report-end') || start;
+    if (start > end) throw new Error('The start date is after the end date.');
+    const orders = await getOrdersByDateRange(start, end);
+    return {
+        start,
+        end,
+        orders: state.user.role === 'owner' ? orders : orders.filter((o) => o.createdBy === state.user.username)
+    };
+}
+
+async function runReport() {
+    try {
+        const { orders } = await reportOrders();
+        const total = orders.reduce((sum, o) => sum + Number(o.totalAmount || 0), 0);
+        const tax = orders.reduce((sum, o) => sum + Number(o.taxAmount || 0), 0);
+        const average = orders.length ? total / orders.length : 0;
+
+        const byCategory = new Map();
+        const byItem = new Map();
+        const byDay = new Map();
+
+        orders.forEach((order) => {
+            const day = isoDate(new Date(order.date));
+            byDay.set(day, (byDay.get(day) || 0) + Number(order.totalAmount || 0));
+            (order.items || []).forEach((item) => {
+                const lineTotal = Number(item.lineTotal != null ? item.lineTotal : item.price * item.quantity) || 0;
+                const category = item.category || 'Uncategorised';
+                const cat = byCategory.get(category) || { qty: 0, total: 0 };
+                cat.qty += Number(item.quantity) || 0;
+                cat.total += lineTotal;
+                byCategory.set(category, cat);
+
+                const entry = byItem.get(item.name) || { qty: 0, total: 0 };
+                entry.qty += Number(item.quantity) || 0;
+                entry.total += lineTotal;
+                byItem.set(item.name, entry);
+            });
+        });
+
+        const bestSellers = [...byItem.entries()].sort((a, b) => b[1].qty - a[1].qty);
+
+        document.getElementById('report-stats').innerHTML = [
+            statCard('Sales', money(total)),
+            statCard('Orders', String(orders.length)),
+            statCard('Average order', money(average)),
+            statCard('Tax collected', money(tax)),
+            statCard('Best seller', bestSellers.length ? esc(bestSellers[0][0]) : '—')
+        ].join('');
+
+        document.getElementById('report-categories').innerHTML = byCategory.size ? table(
+            ['Category', 'Items sold', 'Sales'],
+            [...byCategory.entries()].sort((a, b) => b[1].total - a[1].total).map(([name, data]) => [
+                esc(name), `<span class="num">${num(data.qty)}</span>`, `<span class="num">${money(data.total)}</span>`
+            ])
+        ) : empty('No sales in this range.');
+
+        document.getElementById('report-days').innerHTML = byDay.size ? table(
+            ['Date', 'Sales'],
+            [...byDay.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([day, amount]) => [
+                esc(formatDate(`${day}T12:00:00`)), `<span class="num">${money(amount)}</span>`
+            ])
+        ) : empty('No sales in this range.');
+
+        document.getElementById('report-items').innerHTML = bestSellers.length ? table(
+            ['Item', 'Sold', 'Sales'],
+            bestSellers.slice(0, 15).map(([name, data]) => [
+                esc(name), `<span class="num">${num(data.qty)}</span>`, `<span class="num">${money(data.total)}</span>`
+            ])
+        ) : empty('No sales in this range.');
+    } catch (error) {
+        toast(error.message, 'error');
+    }
+}
+
+function setReportPreset(range) {
+    const now = new Date();
+    let start = new Date(now);
+    if (range === 'week') start.setDate(now.getDate() - 6);
+    if (range === 'month') start = new Date(now.getFullYear(), now.getMonth(), 1);
+    setValue('report-start', isoDate(start));
+    setValue('report-end', isoDate(now));
+    runReport();
+}
+
+async function exportReportCSV() {
+    try {
+        const { start, end, orders } = await reportOrders();
+        if (!orders.length) {
+            toast('There are no orders in that range to export.', 'warning');
+            return;
+        }
+        const rows = [['Order', 'Date', 'Customer', 'Type', 'Payment', 'Taken by', 'Item', 'Category', 'Quantity', 'Unit price', 'Line total', 'Order total']];
+        orders.sort(byNewest).forEach((order) => {
+            (order.items || []).forEach((item) => {
+                rows.push([
+                    order.id,
+                    formatDateTime(order.date),
+                    order.customerName,
+                    order.orderType,
+                    order.paymentMethod || 'Cash',
+                    order.createdBy,
+                    item.name,
+                    item.category || '',
+                    item.quantity,
+                    Number(item.price).toFixed(2),
+                    Number(item.lineTotal != null ? item.lineTotal : item.price * item.quantity).toFixed(2),
+                    Number(order.totalAmount).toFixed(2)
+                ]);
+            });
+        });
+        const csv = rows.map((row) => row.map(csvCell).join(',')).join('\r\n');
+        downloadFile('\uFEFF' + csv, `sales-${start}-to-${end}.csv`, 'text/csv;charset=utf-8');
+        toast('CSV downloaded.', 'success');
+    } catch (error) {
+        toast(error.message, 'error');
+    }
+}
+
+function csvCell(value) {
+    const text = String(value == null ? '' : value);
+    // Stop spreadsheet apps treating a leading =, +, - or @ as a formula.
+    const safe = /^[=+\-@]/.test(text) ? `'${text}` : text;
+    return /[",\r\n]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
+}
+
+/* ------------------------------------------------------------
+   Settings and backups
+   ------------------------------------------------------------ */
+async function renderSettings() {
+    const settings = await getSettings();
+    state.settings = settings;
+    return `
+        <form class="card form" id="settings-form" novalidate>
+            <h2>Shop details</h2>
+            <p class="muted">These appear on receipts and on the sign-in screen.</p>
+            <div class="form-grid">
+                <label class="field"><span>Shop name</span><input type="text" id="shop-name" value="${esc(settings.shopName)}" required></label>
+                <label class="field"><span>Owner name</span><input type="text" id="owner-name" value="${esc(settings.ownerName)}"></label>
+                <label class="field"><span>Phone</span><input type="tel" id="shop-phone" value="${esc(settings.shopPhone)}"></label>
+                <label class="field"><span>Currency symbol</span><input type="text" id="currency-symbol" maxlength="3" value="${esc(settings.currencySymbol)}" required></label>
+                <label class="field"><span>Tax rate (%)</span><input type="number" id="tax-rate" min="0" max="100" step="0.01" value="${esc(settings.taxRate)}"></label>
+            </div>
+            <label class="field"><span>Address</span><input type="text" id="shop-address" value="${esc(settings.shopAddress)}"></label>
+            <label class="field"><span>Receipt footer</span><input type="text" id="receipt-footer" value="${esc(settings.receiptFooter)}"></label>
+            <div class="form-actions"><button type="submit" class="btn btn-primary">Save details</button></div>
+        </form>
+
+        <section class="card">
+            <h2>Backups</h2>
+            <p class="muted">Everything lives in this browser only. Clearing site data or switching devices loses it, so download a backup regularly and keep it somewhere safe.</p>
+            <div class="row-actions">
+                <button type="button" class="btn btn-quiet" data-action="data-export">Download backup</button>
+                <button type="button" class="btn btn-quiet" data-action="data-import">Restore from backup</button>
+                <input type="file" id="import-file" accept="application/json,.json" hidden>
+            </div>
+        </section>
+
+        <section class="card danger-zone">
+            <h2>Erase everything</h2>
+            <p class="muted">Deletes all orders, menu items, stock and accounts in this browser, then restores the default owner login.</p>
+            <button type="button" class="btn btn-danger" data-action="data-clear">Erase all data</button>
+        </section>`;
+}
+
+async function submitSettingsForm() {
+    try {
+        state.settings = await saveSettings({
+            shopName: value('shop-name'),
+            ownerName: value('owner-name'),
+            shopPhone: value('shop-phone'),
+            shopAddress: value('shop-address'),
+            currencySymbol: value('currency-symbol') || '₹',
+            taxRate: Number(value('tax-rate')) || 0,
+            receiptFooter: value('receipt-footer')
+        });
+        const brand = document.querySelector('.brand-name');
+        if (brand) brand.textContent = state.settings.shopName;
+        toast('Details saved.', 'success');
+    } catch (error) {
+        toast(error.message, 'error');
+    }
 }
 
 async function exportData() {
-    const data = await exportAllData();
-    const json = JSON.stringify(data, null, 2);
-    downloadFile(json, 'fb-shop-data.json');
-    showNotification('Data exported', 'success');
-}
-
-function importDataFile() {
-    document.getElementById('import-file').click();
-}
-
-document.addEventListener('change', async (e) => {
-    if (e.target.id === 'import-file') {
-        const file = e.target.files[0];
-        if (file) {
-            const reader = new FileReader();
-            reader.onload = async (event) => {
-                try {
-                    const data = JSON.parse(event.target.result);
-                    await importData(data);
-                    showNotification('Data imported successfully', 'success');
-                    window.location.reload();
-                } catch (error) {
-                    showNotification('Error importing data', 'error');
-                }
-            };
-            reader.readAsText(file);
-        }
-    }
-});
-
-async function resetAllData() {
-    if (confirm('This will delete all data. Are you sure?')) {
-        if (confirm('Really delete all data? This cannot be undone.')) {
-            await clearAllData();
-            showNotification('All data cleared', 'success');
-            window.location.reload();
-        }
+    try {
+        const data = await exportAllData();
+        downloadFile(JSON.stringify(data, null, 2), `fb-shop-backup-${isoDate(new Date())}.json`, 'application/json');
+        toast('Backup downloaded.', 'success');
+    } catch (error) {
+        toast(error.message, 'error');
     }
 }
 
-// ============ UTILITIES ============
-function downloadFile(content, filename) {
-    const element = document.createElement('a');
-    element.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(content));
-    element.setAttribute('download', filename);
-    element.style.display = 'none';
-    document.body.appendChild(element);
-    element.click();
-    document.body.removeChild(element);
+async function importFromFile(file) {
+    if (!file) return;
+    if (!confirm('Restoring replaces everything currently stored in this browser. Continue?')) return;
+    try {
+        const text = await file.text();
+        await importData(JSON.parse(text));
+        toast('Backup restored. Reloading…', 'success');
+        setTimeout(() => window.location.reload(), 600);
+    } catch (error) {
+        console.error(error);
+        toast(error instanceof SyntaxError ? 'That file is not valid JSON.' : error.message, 'error');
+    }
 }
 
-function showNotification(message, type = 'info') {
-    const notification = document.createElement('div');
-    notification.className = `notification ${type}`;
-    notification.textContent = message;
-    document.body.appendChild(notification);
-    
+async function clearData() {
+    if (!confirm('Erase all data in this browser?')) return;
+    if (!confirm('Last check: orders, menu, stock and accounts will be gone. Erase?')) return;
+    try {
+        await clearAllData();
+        await seedDefaults({ withSamples: false });
+        toast('All data erased. Reloading…', 'success');
+        setTimeout(() => window.location.reload(), 600);
+    } catch (error) {
+        toast(error.message, 'error');
+    }
+}
+
+/* ------------------------------------------------------------
+   Receipt
+   ------------------------------------------------------------ */
+function receiptHTML(order) {
+    const s = state.settings;
+    return `
+        <div class="receipt">
+            <h2>${esc(s.shopName)}</h2>
+            ${s.shopAddress ? `<p>${esc(s.shopAddress)}</p>` : ''}
+            ${s.shopPhone ? `<p>${esc(s.shopPhone)}</p>` : ''}
+            <hr>
+            <p>Order #${order.id} · ${esc(formatDateTime(order.date))}</p>
+            <p>${esc(order.orderType)} · ${esc(order.customerName)}</p>
+            <hr>
+            <table>
+                <tbody>
+                    ${(order.items || []).map((item) => `
+                        <tr>
+                            <td>${esc(item.name)}</td>
+                            <td class="num">${item.quantity} × ${money(item.price)}</td>
+                            <td class="num">${money(item.lineTotal != null ? item.lineTotal : item.price * item.quantity)}</td>
+                        </tr>`).join('')}
+                </tbody>
+            </table>
+            <hr>
+            <p class="line"><span>Subtotal</span><span class="num">${money(order.subtotal != null ? order.subtotal : order.totalAmount)}</span></p>
+            ${Number(order.taxAmount) ? `<p class="line"><span>Tax ${num(order.taxRate)}%</span><span class="num">${money(order.taxAmount)}</span></p>` : ''}
+            <p class="line total"><span>Total</span><span class="num">${money(order.totalAmount)}</span></p>
+            <p class="line"><span>Paid by</span><span>${esc(order.paymentMethod)}</span></p>
+            ${order.notes ? `<p>Note: ${esc(order.notes)}</p>` : ''}
+            <hr>
+            <p class="center">${esc(s.receiptFooter || '')}</p>
+            <p class="center muted">Served by ${esc(order.createdBy)}</p>
+        </div>`;
+}
+
+function showReceipt(order) {
+    openModal(`Order #${order.id} saved`, receiptHTML(order),
+        `<button type="button" class="btn btn-quiet" data-action="order-print" data-id="${order.id}">Print receipt</button>`);
+}
+
+async function printOrder(id) {
+    const order = await getOrder(id);
+    if (!order) return;
+    document.getElementById('print-area').innerHTML = receiptHTML(order);
+    window.print();
+}
+
+/* ------------------------------------------------------------
+   Modal, toasts, helpers
+   ------------------------------------------------------------ */
+function openModal(title, bodyHTML, extraActions = '') {
+    document.getElementById('modal-root').innerHTML = `
+        <div class="modal-backdrop" data-action="modal-close">
+            <div class="modal" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+                <div class="modal-head">
+                    <h2>${esc(title)}</h2>
+                    <button type="button" class="icon-btn" data-action="modal-close" aria-label="Close">✕</button>
+                </div>
+                <div class="modal-body">${bodyHTML}</div>
+                <div class="modal-foot">
+                    ${extraActions}
+                    <button type="button" class="btn btn-primary" data-action="modal-close">Done</button>
+                </div>
+            </div>
+        </div>`;
+    const button = document.querySelector('.modal-foot .btn-primary');
+    if (button) button.focus();
+}
+
+function closeModal() {
+    document.getElementById('modal-root').innerHTML = '';
+}
+
+function toast(message, type = 'info') {
+    const node = document.createElement('div');
+    node.className = `toast toast-${type}`;
+    node.textContent = message;
+    document.getElementById('toasts').appendChild(node);
     setTimeout(() => {
-        notification.remove();
-    }, 3000);
+        node.classList.add('is-leaving');
+        setTimeout(() => node.remove(), 250);
+    }, 3200);
 }
 
-function viewOrder(orderId) {
-    alert('Order details view - Order ID: ' + orderId);
+function esc(value) {
+    return String(value == null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function money(amount) {
+    const n = Number(amount) || 0;
+    const symbol = String(state.settings.currencySymbol || '₹').replace(/[<>&"']/g, '');
+    // "₹120.00" reads fine; "MVR120.00" does not.
+    return `${symbol}${symbol.length > 1 ? ' ' : ''}${n.toFixed(2)}`;
+}
+
+function num(value) {
+    const n = Number(value) || 0;
+    return Number.isInteger(n) ? String(n) : String(Math.round(n * 100) / 100);
+}
+
+function isoDate(date) {
+    const d = date instanceof Date ? date : new Date(date);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function formatDate(date) {
+    if (!date) return '—';
+    return new Date(date).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+function formatTime(date) {
+    return new Date(date).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+}
+
+function formatDateTime(date) {
+    return `${formatDate(date)}, ${formatTime(date)}`;
+}
+
+function byNewest(a, b) {
+    return String(b.date).localeCompare(String(a.date));
+}
+
+function table(headers, rows) {
+    if (!rows.length) return empty('Nothing here yet.');
+    return `
+        <div class="table-wrap">
+            <table>
+                <thead><tr>${headers.map((h) => `<th scope="col">${esc(h)}</th>`).join('')}</tr></thead>
+                <tbody>${rows.map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join('')}</tr>`).join('')}</tbody>
+            </table>
+        </div>`;
+}
+
+function empty(message) {
+    return `<p class="empty">${esc(message)}</p>`;
+}
+
+function options(values) {
+    return values.map((v) => `<option value="${esc(v)}">${esc(v)}</option>`).join('');
+}
+
+function value(id) {
+    const el = document.getElementById(id);
+    return el ? el.value.trim() : '';
+}
+
+function setValue(id, val) {
+    const el = document.getElementById(id);
+    if (el) el.value = val;
+}
+
+function setText(id, text) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+}
+
+function downloadFile(content, filename, mime) {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/* ------------------------------------------------------------
+   Event wiring — one listener each, delegated by data-action.
+   Inline onclick handlers are gone, so item names with quotes or
+   angle brackets can no longer break (or hijack) the page.
+   ------------------------------------------------------------ */
+function bindGlobalEvents() {
+    document.addEventListener('click', onClick);
+    document.addEventListener('submit', onSubmit);
+    document.addEventListener('input', onInput);
+    document.addEventListener('change', onChange);
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            closeModal();
+            document.body.classList.remove('nav-open');
+        }
+    });
+    window.addEventListener('afterprint', () => {
+        const area = document.getElementById('print-area');
+        if (area) area.innerHTML = '';
+    });
+}
+
+async function onClick(event) {
+    const trigger = event.target.closest('[data-action]');
+    if (!trigger) return;
+    const { action, id, index, page, category, range } = trigger.dataset;
+
+    // Only the backdrop itself should close the modal, not clicks inside it.
+    if (action === 'modal-close' && trigger.classList.contains('modal-backdrop') && event.target !== trigger) return;
+
+    const actions = {
+        nav: () => navigate(page),
+        'toggle-nav': () => document.body.classList.toggle('nav-open'),
+        'close-nav': () => document.body.classList.remove('nav-open'),
+        logout,
+        'modal-close': closeModal,
+
+        'pos-category': () => {
+            state.posCategory = category;
+            document.querySelectorAll('#pos-categories .chip').forEach((chip) => {
+                chip.classList.toggle('is-active', chip.dataset.category === category);
+            });
+            refreshPOSItems();
+        },
+        'pos-add': () => addToCart(Number(id)),
+        'cart-inc': () => { state.cart[Number(index)].quantity += 1; updateCart(); },
+        'cart-dec': () => {
+            const line = state.cart[Number(index)];
+            if (line.quantity > 1) line.quantity -= 1;
+            else state.cart.splice(Number(index), 1);
+            updateCart();
+        },
+        'cart-remove': () => { state.cart.splice(Number(index), 1); updateCart(); },
+        'cart-clear': () => {
+            if (!state.cart.length || confirm('Clear the ticket?')) {
+                state.cart = [];
+                updateCart();
+            }
+        },
+        'order-complete': completeOrder,
+        'order-view': () => viewOrder(Number(id)),
+        'order-print': () => printOrder(Number(id)),
+        'order-delete': () => deleteOrderAction(Number(id)),
+
+        'menu-new': async () => { state.editing = { menu: null }; await navigate('menu'); },
+        'menu-edit': async () => { state.editing = { menu: await getMenuItem(Number(id)) }; await navigate('menu'); },
+        'menu-cancel': async () => { state.editing = {}; await navigate('menu'); },
+        'menu-delete': async () => {
+            if (!confirm('Delete this menu item? Past orders keep their own copy of it.')) return;
+            await deleteMenuItem(Number(id));
+            toast('Item deleted.', 'success');
+            await navigate('menu');
+        },
+
+        'inv-new': async () => { state.editing = { inventory: null }; await navigate('inventory'); },
+        'inv-edit': async () => { state.editing = { inventory: await getInventoryItem(Number(id)) }; await navigate('inventory'); },
+        'inv-cancel': async () => { state.editing = {}; await navigate('inventory'); },
+        'inv-delete': async () => {
+            if (!confirm('Delete this stock item?')) return;
+            await deleteInventoryItem(Number(id));
+            toast('Stock item deleted.', 'success');
+            await navigate('inventory');
+        },
+
+        'user-new': async () => { state.editing = { user: null }; await navigate('users'); },
+        'user-edit': async () => { state.editing = { user: await getUserById(Number(id)) }; await navigate('users'); },
+        'user-cancel': async () => { state.editing = {}; await navigate('users'); },
+        'user-delete': () => deleteUserAction(Number(id)),
+
+        'report-run': runReport,
+        'report-preset': () => setReportPreset(range),
+        'report-csv': exportReportCSV,
+
+        'data-export': exportData,
+        'data-import': () => document.getElementById('import-file').click(),
+        'data-clear': clearData
+    };
+
+    const handler = actions[action];
+    if (!handler) return;
+    event.preventDefault();
+    try {
+        await handler();
+    } catch (error) {
+        console.error(error);
+        toast(error.message || 'Something went wrong.', 'error');
+    }
+}
+
+function onSubmit(event) {
+    const form = event.target;
+    const handlers = {
+        'login-form': handleLogin,
+        'menu-form': submitMenuForm,
+        'inventory-form': submitInventoryForm,
+        'user-form': submitUserForm,
+        'settings-form': submitSettingsForm
+    };
+    const handler = handlers[form.id];
+    if (!handler) return;
+    event.preventDefault();
+    handler(form);
+}
+
+function onInput(event) {
+    if (event.target.id === 'pos-search') {
+        state.posSearch = event.target.value;
+        refreshPOSItems();
+    }
+}
+
+function onChange(event) {
+    if (event.target.id === 'import-file') {
+        const file = event.target.files[0];
+        event.target.value = '';
+        importFromFile(file);
+    }
 }
